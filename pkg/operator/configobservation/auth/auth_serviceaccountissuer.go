@@ -5,14 +5,14 @@ import (
 	"net/url"
 	"strings"
 
-	v1 "github.com/openshift/api/config/v1"
+	configv1 "github.com/openshift/api/config/v1"
+	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
 	"github.com/openshift/cluster-kube-apiserver-operator/pkg/operator/configobservation"
+	"github.com/openshift/library-go/pkg/operator/configobserver"
+	"github.com/openshift/library-go/pkg/operator/events"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/klog/v2"
-
-	"github.com/openshift/library-go/pkg/operator/configobserver"
-	"github.com/openshift/library-go/pkg/operator/events"
 )
 
 // ObserveServiceAccountIssuer changes apiServerArguments.service-account-issuer from
@@ -33,11 +33,22 @@ func ObserveServiceAccountIssuer(
 // Authentication resource.
 func observedConfig(
 	existingConfig map[string]interface{},
-	authConfigAccessor func(string) (*v1.Authentication, error),
+	authConfigAccessor func(string) (*configv1.Authentication, error),
+	infrastructureConfigAccessor func(string) (*configv1.Infrastructure, error),
 ) (map[string]interface{}, []error) {
 
 	issuer, errs := observedIssuer(existingConfig, authConfigAccessor)
-	config := unstructuredConfigForIssuer(issuer)
+
+	infrastructureConfig, err := infrastructureConfigAccessor("cluster")
+	if err != nil {
+		return err
+	}
+	apiServerInternalURL := infrastructureConfig.Status.APIServerInternalURL
+	if len(apiServerInternalURL) == 0 {
+		return fmt.Errorf("APIServerInternalURL missing from infrastructure/cluster")
+	}
+
+	config := unstructuredConfigForIssuer(issuer, apiServerInternalURL)
 	return config, errs
 }
 
@@ -47,7 +58,7 @@ func observedConfig(
 // issuer. If that is not possible, then an empty string will be returned.
 func observedIssuer(
 	existingConfig map[string]interface{},
-	authConfigAccessor func(string) (*v1.Authentication, error),
+	authConfigAccessor func(string) (*configv1.Authentication, error),
 ) (string, []error) {
 	errs := []error{}
 
@@ -105,7 +116,7 @@ func issuerFromUnstructuredConfig(config map[string]interface{}) (string, []erro
 
 // unstructuredConfigForIssuer creates an unstructured KubeAPIServerConfig fragment
 // for the given issuer.
-func unstructuredConfigForIssuer(issuer string) map[string]interface{} {
+func unstructuredConfigForIssuer(issuer string, lbIntURL string) map[string]interface{} {
 	// Returning an empty config when no value is provided for issuer ensures that
 	// the default value will not be overwritten by an empty value.
 	if len(issuer) == 0 {
@@ -115,6 +126,11 @@ func unstructuredConfigForIssuer(issuer string) map[string]interface{} {
 		"apiServerArguments": map[string]interface{}{
 			"service-account-issuer": []interface{}{
 				issuer,
+			},
+			"service-account-jwks-uri": []interface{}{
+				// We need to set the URL so it point to our LB and doesn't default to KAS IP
+				// which isn't in the serving certificate.
+				lbIntURL + "/openid/v1/jwks",
 			},
 		},
 	}
